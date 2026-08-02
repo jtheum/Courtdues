@@ -65,6 +65,7 @@ export default function CourtDues() {
   const [pinTry, setPinTry] = useState("");
   const [pinErr, setPinErr] = useState("");
   const [tab, setTab] = useState("roster"); // roster | sessions | courts | settings
+  const [viewTab, setViewTab] = useState("standings"); // standings | upcoming
   const [copied, setCopied] = useState(false);
 
   // ---- load + live updates ----
@@ -195,6 +196,17 @@ export default function CourtDues() {
     });
   const removeSession = (id) =>
     persist({ ...data, sessions: data.sessions.filter((s) => s.id !== id) });
+  const duplicateSession = (id) => {
+    const s = data.sessions.find((x) => x.id === id);
+    if (!s) return;
+    const { id: _drop, ...rest } = s;
+    const d = new Date((s.date || todayISO()) + "T00:00:00");
+    d.setDate(d.getDate() + 7); // default the copy to next week
+    persist({
+      ...data,
+      sessions: [...data.sessions, { ...rest, id: uid(), date: d.toISOString().slice(0, 10) }],
+    });
+  };
 
   const addCourt = (name, cost) => {
     const nm = (name || "").trim();
@@ -337,30 +349,56 @@ export default function CourtDues() {
         {/* ===== VIEW MODE ===== */}
         {mode === "view" && (
           <>
-            <NextGameCard game={nextGame} />
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              <Stat label="Collected" value={money(totals.collected)} tone="emerald" />
-              <Stat label="Outstanding" value={money(totals.outstanding)} tone="orange" />
-            </div>
-
-            <div className="mt-6 flex items-center justify-between">
-              <h2 className="text-xs uppercase tracking-widest text-stone-500">Standings</h2>
-              <button
-                onClick={copyStandings}
-                className="text-xs font-semibold text-orange-400 hover:text-orange-300"
-              >
-                {copied ? "Copied ✓" : "Copy for group chat"}
-              </button>
-            </div>
-
-            <div className="mt-3 space-y-2">
-              {totals.rows.length === 0 && (
-                <EmptyNote text="No players yet. Tap Manage to add your squad." />
-              )}
-              {totals.rows.map((r) => (
-                <StandingRow key={r.id} r={r} />
+            <InstallPrompt />
+            <div className="mt-5 flex gap-1 rounded-xl bg-stone-900 p-1 text-sm">
+              {[
+                ["standings", "Standings"],
+                ["upcoming", "Upcoming"],
+              ].map(([k, label]) => (
+                <button
+                  key={k}
+                  onClick={() => setViewTab(k)}
+                  className={`flex-1 rounded-lg py-2 text-xs font-semibold transition-colors ${
+                    viewTab === k ? "bg-orange-500 text-stone-950" : "text-stone-400 hover:text-stone-200"
+                  }`}
+                >
+                  {label}
+                </button>
               ))}
             </div>
+
+            {viewTab === "standings" && (
+              <>
+                <NextGameCard game={nextGame} />
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <Stat label="Collected" value={money(totals.collected)} tone="emerald" />
+                  <Stat label="Outstanding" value={money(totals.outstanding)} tone="orange" />
+                </div>
+
+                <div className="mt-6 flex items-center justify-between">
+                  <h2 className="text-xs uppercase tracking-widest text-stone-500">Standings</h2>
+                  <button
+                    onClick={copyStandings}
+                    className="text-xs font-semibold text-orange-400 hover:text-orange-300"
+                  >
+                    {copied ? "Copied ✓" : "Copy for group chat"}
+                  </button>
+                </div>
+
+                <div className="mt-3 space-y-2">
+                  {totals.rows.length === 0 && (
+                    <EmptyNote text="No players yet. Tap Manage to add your squad." />
+                  )}
+                  {totals.rows.map((r) => (
+                    <StandingRow key={r.id} r={r} />
+                  ))}
+                </div>
+              </>
+            )}
+
+            {viewTab === "upcoming" && (
+              <UpcomingSessions sessions={data.sessions} players={data.players} />
+            )}
           </>
         )}
 
@@ -402,6 +440,7 @@ export default function CourtDues() {
                 onAdd={addSession}
                 onUpdate={updateSession}
                 onRemove={removeSession}
+                onDuplicate={duplicateSession}
                 onAddCourt={addCourt}
                 goToCourts={() => setTab("courts")}
               />
@@ -513,6 +552,149 @@ function EmptyNote({ text }) {
   return (
     <div className="rounded-xl border border-dashed border-stone-800 bg-stone-900/40 p-5 text-center text-sm text-stone-500">
       {text}
+    </div>
+  );
+}
+
+/* ---------- Add to home screen prompt ---------- */
+
+function InstallPrompt() {
+  const [deferred, setDeferred] = useState(null);
+  const [isIOS, setIsIOS] = useState(false);
+  const [standalone, setStandalone] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+
+  useEffect(() => {
+    // Android: use the captured install event (or listen for a later one).
+    if (window.__bipEvent) setDeferred(window.__bipEvent);
+    const onBIP = (e) => {
+      e.preventDefault();
+      window.__bipEvent = e;
+      setDeferred(e);
+    };
+    const onInstalled = () => setDismissed(true);
+    window.addEventListener("beforeinstallprompt", onBIP);
+    window.addEventListener("appinstalled", onInstalled);
+
+    const ua = window.navigator.userAgent || "";
+    setIsIOS(/iphone|ipad|ipod/i.test(ua) && !/crios|fxios/i.test(ua)); // Safari on iOS only
+    setStandalone(
+      window.matchMedia("(display-mode: standalone)").matches ||
+        window.navigator.standalone === true
+    );
+
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onBIP);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  // Hide if already installed, dismissed, or we can't actually help (e.g. desktop).
+  if (standalone || dismissed) return null;
+  if (!deferred && !isIOS) return null;
+
+  const onClick = async () => {
+    if (deferred) {
+      deferred.prompt();
+      await deferred.userChoice;
+      window.__bipEvent = null;
+      setDeferred(null);
+      setDismissed(true);
+    } else {
+      setShowHelp((v) => !v);
+    }
+  };
+
+  return (
+    <div className="mt-5 rounded-xl border border-orange-500/30 bg-stone-900 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="text-sm text-stone-300">📲 Add Court Dues to your home screen</div>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={onClick}
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-orange-500 text-stone-950 hover:bg-orange-400"
+          >
+            {deferred ? "Add" : "How?"}
+          </button>
+          <button
+            onClick={() => setDismissed(true)}
+            aria-label="Dismiss"
+            className="text-stone-500 hover:text-stone-300 text-sm px-1.5"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+      {showHelp && isIOS && (
+        <div className="mt-2 text-xs text-stone-400 leading-relaxed">
+          Tap the <b className="text-stone-200">Share</b> button (the square with an up arrow) at
+          the bottom of Safari, scroll down, and choose{" "}
+          <b className="text-stone-200">Add to Home Screen</b>.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------- Upcoming sessions (viewer) ---------- */
+
+function UpcomingSessions({ sessions, players }) {
+  const t = todayISO();
+  const pmap = Object.fromEntries(players.map((p) => [p.id, p.name]));
+  const upcoming = [...sessions]
+    .filter((s) => s.date && s.date >= t)
+    .sort((a, b) => a.date.localeCompare(b.date) || (a.time || "").localeCompare(b.time || ""));
+
+  if (upcoming.length === 0)
+    return (
+      <div className="mt-4">
+        <EmptyNote text="No upcoming sessions scheduled." />
+      </div>
+    );
+
+  return (
+    <div className="mt-4 space-y-3">
+      {upcoming.map((s) => {
+        const names = (s.attendees || []).map((id) => pmap[id]).filter(Boolean);
+        return (
+          <div key={s.id} className="rounded-2xl border border-stone-800 bg-stone-900 p-4">
+            <div className="flex items-baseline justify-between">
+              <div className="text-lg font-black tracking-tight">{prettyDate(s.date)}</div>
+              <div className="inline-flex items-baseline gap-1 rounded-lg bg-stone-950/60 px-2.5 py-1">
+                <span className="font-mono text-sm font-bold text-orange-400">
+                  {money(perPlayer(s))}
+                </span>
+                <span className="text-[11px] text-stone-500">/ player</span>
+              </div>
+            </div>
+            <div className="mt-1 text-sm text-stone-300">{timeRange(s)}</div>
+            {s.place && (
+              <div className="mt-1 flex items-center gap-1.5 text-sm text-stone-400">
+                <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 text-orange-500" fill="currentColor">
+                  <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5a2.5 2.5 0 110-5 2.5 2.5 0 010 5z" />
+                </svg>
+                <span>{s.place}</span>
+              </div>
+            )}
+            <div className="mt-2 text-[11px] text-stone-500">
+              {money(sessionTotal(s))} court · {attCount(s)} player{attCount(s) === 1 ? "" : "s"} in
+            </div>
+            {names.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {names.map((n) => (
+                  <span
+                    key={n}
+                    className="text-[11px] px-2 py-0.5 rounded-full bg-stone-800 text-stone-300"
+                  >
+                    {n}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -639,7 +821,7 @@ function RosterManager({ rows, onAdd, onRemove, onPay }) {
 
 /* ---------- Sessions manager ---------- */
 
-function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove, onAddCourt, goToCourts }) {
+function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove, onDuplicate, onAddCourt, goToCourts }) {
   const [date, setDate] = useState(todayISO());
   const [time, setTime] = useState("18:00");
   const [endTime, setEndTime] = useState("20:00");
@@ -941,12 +1123,23 @@ function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove,
                       );
                     })}
                   </div>
-                  <button
-                    onClick={() => onRemove(s.id)}
-                    className="mt-4 text-xs text-rose-400 hover:text-rose-300"
-                  >
-                    Delete this session
-                  </button>
+                  <div className="mt-4 flex items-center gap-4">
+                    <button
+                      onClick={() => {
+                        onDuplicate(s.id);
+                        setExpanded(null);
+                      }}
+                      className="text-xs font-semibold text-orange-400 hover:text-orange-300"
+                    >
+                      Duplicate to next week
+                    </button>
+                    <button
+                      onClick={() => onRemove(s.id)}
+                      className="text-xs text-rose-400 hover:text-rose-300"
+                    >
+                      Delete this session
+                    </button>
+                  </div>
                 </div>
               )}
             </div>

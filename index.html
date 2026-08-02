@@ -2,9 +2,27 @@
 <html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      // Capture Android's install event as early as possible so the in-app
+      // button can trigger it later, even if it fires before React mounts.
+      window.addEventListener("beforeinstallprompt", (e) => {
+        e.preventDefault();
+        window.__bipEvent = e;
+      });
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#0c0a09" />
     <title>Court Dues</title>
+
+    <!-- Installable web app (Add to Home Screen) -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Court Dues" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
     <!-- Tailwind Play CDN: zero build config, perfect for a small app like this.
          It prints a console note about not being for large-scale production; fine here.
          To remove that note later, install Tailwind properly (see README). -->
@@ -16,5 +34,13 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+    <script>
+      // Register the service worker so the app is installable on Android.
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js").catch(() => {});
+        });
+      }
+    </script>
   </body>
 </html>
