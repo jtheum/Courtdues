@@ -1,8 +1,21 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { supabase } from "./supabaseClient";
 
-// One shared board for the whole group. Change this if you ever run two crews.
-const SLUG = "main";
+// Each group is its own board, chosen by the ?g= slug in the URL.
+// courtdues.com -> "main"; courtdues.com/?g=eastside -> "eastside".
+const SLUG = (new URLSearchParams(window.location.search).get("g") || "main")
+  .toLowerCase()
+  .trim();
+const slugify = (s) =>
+  (s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "group";
+const groupUrl = (slug) =>
+  slug === "main" ? window.location.origin + "/" : window.location.origin + "/?g=" + slug;
+
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const uid = () =>
   (crypto.randomUUID && crypto.randomUUID()) ||
@@ -47,7 +60,7 @@ const sessionTotal = (s) => {
   return num(s.cost) * attCount(s);
 };
 
-const empty = { players: [], sessions: [], payments: [], courts: [], pin: "" };
+const empty = { players: [], sessions: [], payments: [], courts: [], pin: "", name: "" };
 
 const DEFAULT_COURTS = [
   "Tyngsborough Sports Center",
@@ -60,10 +73,10 @@ export default function CourtDues() {
   const [data, setData] = useState(empty);
   const [loading, setLoading] = useState(true);
   const [saveErr, setSaveErr] = useState("");
-  const [mode, setMode] = useState("view"); // view | manage | pin
-  const [unlocked, setUnlocked] = useState(false);
-  const [pinTry, setPinTry] = useState("");
-  const [pinErr, setPinErr] = useState("");
+  const [mode, setMode] = useState("view"); // view | manage | login
+  const [session, setSession] = useState(null);
+  const [isManager, setIsManager] = useState(false);
+  const [boardUnclaimed, setBoardUnclaimed] = useState(false);
   const [tab, setTab] = useState("roster"); // roster | sessions | courts | settings
   const [viewTab, setViewTab] = useState("standings"); // standings | upcoming
   const [copied, setCopied] = useState(false);
@@ -115,6 +128,63 @@ export default function CourtDues() {
       supabase.removeChannel(channel);
     };
   }, []);
+
+  // ---- auth: track session + whether the user manages THIS board ----
+  const refreshManagerStatus = async (sess) => {
+    if (!sess) {
+      setIsManager(false);
+      // Is this board unclaimed (no manager yet)? Controls the "Claim" option.
+      const { data: unclaimed } = await supabase.rpc("board_is_unclaimed", { p_slug: SLUG });
+      setBoardUnclaimed(!!unclaimed);
+      return;
+    }
+    const { data: mine } = await supabase
+      .from("board_managers")
+      .select("user_id")
+      .eq("board_slug", SLUG)
+      .eq("user_id", sess.user.id)
+      .maybeSingle();
+    setIsManager(!!mine);
+    if (!mine) {
+      const { data: unclaimed } = await supabase.rpc("board_is_unclaimed", { p_slug: SLUG });
+      setBoardUnclaimed(!!unclaimed);
+    } else {
+      setBoardUnclaimed(false);
+    }
+  };
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setSession(s);
+      refreshManagerStatus(s);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+      setSession(s);
+      refreshManagerStatus(s);
+      if (!s && mode === "manage") setMode("view"); // signed out while managing
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const claimBoard = async () => {
+    if (!session) return;
+    const { error } = await supabase
+      .from("board_managers")
+      .insert({ board_slug: SLUG, user_id: session.user.id });
+    if (!error) {
+      setIsManager(true);
+      setBoardUnclaimed(false);
+      setMode("manage");
+    }
+  };
+
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    setSession(null);
+    setIsManager(false);
+    setMode("view");
+    refreshManagerStatus(null);
+  };
 
   const persist = async (next) => {
     setData(next);
@@ -221,24 +291,69 @@ export default function CourtDues() {
   const removeCourt = (id) =>
     persist({ ...data, courts: data.courts.filter((c) => c.id !== id) });
 
-  const setPin = (pin) => persist({ ...data, pin });
+  const setGroupName = (name) => persist({ ...data, name });
 
-  const tryUnlock = () => {
-    if (!data.pin || pinTry === data.pin) {
-      setUnlocked(true);
-      setMode("manage");
-      setPinErr("");
-      setPinTry("");
-    } else {
-      setPinErr("That PIN doesn't match.");
+  const displayName = data.name || (SLUG === "main" ? "Main" : SLUG);
+
+  // Create a blank group. If claimForSelf is true, you become its manager.
+  // If false, it's left unclaimed so another person can sign in and claim it.
+  const createGroup = async (name, claimForSelf = true) => {
+    if (!session) return { error: "Please sign in first." };
+    let base = slugify(name);
+    let slug = base;
+    let n = 1;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const { data: existing } = await supabase
+        .from("boards")
+        .select("slug")
+        .eq("slug", slug)
+        .maybeSingle();
+      if (!existing) break;
+      n += 1;
+      slug = `${base}-${n}`;
     }
+    const blank = {
+      players: [],
+      sessions: [],
+      payments: [],
+      courts: DEFAULT_COURTS.map((cn) => ({ id: uid(), name: cn, cost: 0 })),
+      name: (name || "").trim() || slug,
+      seeded: true,
+    };
+    const { error } = await supabase.from("boards").insert({ slug, data: blank });
+    if (error) return { error: "Couldn't create the group. Try a different name." };
+    if (claimForSelf) {
+      const { error: mErr } = await supabase
+        .from("board_managers")
+        .insert({ board_slug: slug, user_id: session.user.id });
+      if (mErr)
+        return { error: "Group created, but claiming it failed. Open its link and Claim it." };
+    }
+    return { slug, name: blank.name, link: groupUrl(slug), claimed: claimForSelf };
   };
+
+  // Only the groups the signed-in manager owns.
+  const listGroups = async () => {
+    if (!session) return [];
+    const { data: rows } = await supabase
+      .from("board_managers")
+      .select("board_slug, boards(slug, data)")
+      .eq("user_id", session.user.id);
+    return (rows || [])
+      .map((r) => {
+        const b = r.boards || {};
+        return {
+          slug: r.board_slug,
+          name: (b.data && b.data.name) || (r.board_slug === "main" ? "Main" : r.board_slug),
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  };
+
   const enterManage = () => {
-    if (data.pin && !unlocked) setMode("pin");
-    else {
-      setUnlocked(true);
-      setMode("manage");
-    }
+    if (isManager) setMode("manage");
+    else setMode("login"); // login screen handles: sign in, or claim, or "not yours"
   };
 
   const copyStandings = () => {
@@ -289,7 +404,7 @@ export default function CourtDues() {
               COURT<span className="text-orange-500">DUES</span>
             </h1>
             <p className="text-[11px] uppercase tracking-widest text-stone-500 mt-1">
-              Pickup run ledger
+              {displayName}
             </p>
           </div>
           {mode !== "manage" ? (
@@ -316,34 +431,17 @@ export default function CourtDues() {
         )}
 
         {/* PIN gate */}
-        {mode === "pin" && (
-          <div className="mt-6 rounded-2xl border border-stone-800 bg-stone-900 p-5">
-            <p className="text-sm text-stone-300 mb-3">Enter the manager PIN to edit.</p>
-            <div className="flex gap-2">
-              <input
-                type="password"
-                inputMode="numeric"
-                value={pinTry}
-                onChange={(e) => setPinTry(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && tryUnlock()}
-                placeholder="PIN"
-                className="flex-1 rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none focus:border-orange-500"
-              />
-              <button
-                onClick={tryUnlock}
-                className="px-4 py-2 rounded-lg bg-orange-500 text-stone-950 text-sm font-semibold hover:bg-orange-400"
-              >
-                Unlock
-              </button>
-            </div>
-            {pinErr && <p className="text-xs text-rose-400 mt-2">{pinErr}</p>}
-            <button
-              onClick={() => setMode("view")}
-              className="text-xs text-stone-500 mt-3 hover:text-stone-300"
-            >
-              Cancel
-            </button>
-          </div>
+        {mode === "login" && (
+          <AuthGate
+            session={session}
+            isManager={isManager}
+            boardUnclaimed={boardUnclaimed}
+            groupName={displayName}
+            onClaim={claimBoard}
+            onSignOut={signOut}
+            onManage={() => setMode("manage")}
+            onCancel={() => setMode("view")}
+          />
         )}
 
         {/* ===== VIEW MODE ===== */}
@@ -453,7 +551,17 @@ export default function CourtDues() {
                 onRemove={removeCourt}
               />
             )}
-            {tab === "settings" && <SettingsPanel pin={data.pin} onSetPin={setPin} />}
+            {tab === "settings" && (
+              <SettingsPanel
+                slug={SLUG}
+                groupName={displayName}
+                onSetGroupName={setGroupName}
+                onCreateGroup={createGroup}
+                onListGroups={listGroups}
+                email={session && session.user && session.user.email}
+                onSignOut={signOut}
+              />
+            )}
           </>
         )}
 
@@ -1267,35 +1375,375 @@ function CourtsManager({ courts, onAdd, onUpdate, onRemove }) {
 
 /* ---------- Settings ---------- */
 
-function SettingsPanel({ pin, onSetPin }) {
-  const [val, setVal] = useState(pin || "");
-  const [saved, setSaved] = useState(false);
+function AuthGate({ session, isManager, boardUnclaimed, groupName, onClaim, onSignOut, onManage, onCancel }) {
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [err, setErr] = useState("");
+
+  const sendLink = async () => {
+    if (!email.trim()) return;
+    setSending(true);
+    setErr("");
+    const { error } = await supabase.auth.signInWithOtp({
+      email: email.trim(),
+      options: { emailRedirectTo: window.location.href },
+    });
+    setSending(false);
+    if (error) setErr(error.message || "Couldn't send the link.");
+    else setSent(true);
+  };
+
   return (
-    <div className="mt-4 rounded-xl border border-stone-800 bg-stone-900 p-4">
-      <div className="text-xs uppercase tracking-widest text-stone-500 mb-2">Manager PIN</div>
-      <p className="text-xs text-stone-400 mb-3">
-        Set a PIN so only you can unlock Manage mode. Leave it blank for no lock. This is a light
-        guard for a trusted group, not real security.
-      </p>
-      <div className="flex gap-2">
-        <input
-          type="text"
-          inputMode="numeric"
-          value={val}
-          onChange={(e) => setVal(e.target.value)}
-          placeholder="No PIN set"
-          className="flex-1 rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none focus:border-orange-500"
-        />
-        <button
-          onClick={() => {
-            onSetPin(val.trim());
-            setSaved(true);
-            setTimeout(() => setSaved(false), 1500);
-          }}
-          className="px-4 rounded-lg bg-orange-500 text-stone-950 text-sm font-semibold hover:bg-orange-400"
-        >
-          {saved ? "Saved ✓" : "Save"}
-        </button>
+    <div className="mt-6 rounded-2xl border border-stone-800 bg-stone-900 p-5">
+      {!session ? (
+        sent ? (
+          <>
+            <div className="text-sm font-semibold text-emerald-300">Check your email</div>
+            <p className="mt-1 text-xs text-stone-400">
+              We sent a sign-in link to {email}. Open it on this device to finish signing in.
+            </p>
+            <button onClick={onCancel} className="text-xs text-stone-500 mt-3 hover:text-stone-300">
+              Back
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="text-sm font-semibold text-stone-200">Manager sign in</div>
+            <p className="mt-1 text-xs text-stone-400 mb-3">
+              Enter your email and we'll send a one-tap sign-in link. Viewers don't need this.
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && sendLink()}
+                placeholder="you@email.com"
+                className="flex-1 rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none focus:border-orange-500"
+              />
+              <button
+                onClick={sendLink}
+                disabled={sending || !email.trim()}
+                className="px-4 rounded-lg bg-orange-500 text-stone-950 text-sm font-semibold hover:bg-orange-400 disabled:opacity-40"
+              >
+                {sending ? "Sending…" : "Send link"}
+              </button>
+            </div>
+            {err && <p className="text-xs text-rose-400 mt-2">{err}</p>}
+            <button onClick={onCancel} className="text-xs text-stone-500 mt-3 hover:text-stone-300">
+              Cancel
+            </button>
+          </>
+        )
+      ) : isManager ? (
+        <>
+          <div className="text-sm text-stone-200">
+            You manage <b className="text-stone-100">{groupName}</b>.
+          </div>
+          <button
+            onClick={onManage}
+            className="mt-3 w-full rounded-lg bg-orange-500 text-stone-950 py-2.5 text-sm font-bold hover:bg-orange-400"
+          >
+            Manage this group
+          </button>
+          <button onClick={onSignOut} className="text-xs text-stone-500 mt-3 hover:text-stone-300">
+            Sign out
+          </button>
+        </>
+      ) : boardUnclaimed ? (
+        <>
+          <div className="text-sm text-stone-200">
+            No one manages <b className="text-stone-100">{groupName}</b> yet.
+          </div>
+          <p className="mt-1 text-xs text-stone-400">
+            Claim it to become its manager. Only do this for a group that's yours.
+          </p>
+          <button
+            onClick={onClaim}
+            className="mt-3 w-full rounded-lg bg-orange-500 text-stone-950 py-2.5 text-sm font-bold hover:bg-orange-400"
+          >
+            Claim this group
+          </button>
+          <button onClick={onSignOut} className="text-xs text-stone-500 mt-3 hover:text-stone-300">
+            Sign out
+          </button>
+        </>
+      ) : (
+        <>
+          <div className="text-sm text-stone-200">This group is managed by someone else.</div>
+          <p className="mt-1 text-xs text-stone-400">
+            You can view it, but only its manager can edit. If it's yours, sign in with the email
+            that manages it.
+          </p>
+          <button
+            onClick={onCancel}
+            className="mt-3 w-full rounded-lg bg-stone-800 text-stone-200 py-2.5 text-sm font-semibold hover:bg-stone-700"
+          >
+            Back to standings
+          </button>
+          <button onClick={onSignOut} className="text-xs text-stone-500 mt-3 hover:text-stone-300">
+            Sign out
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function SettingsPanel({ slug, groupName, onSetGroupName, onCreateGroup, onListGroups, email, onSignOut }) {
+  const [nameVal, setNameVal] = useState(groupName || "");
+  const [nameSaved, setNameSaved] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
+
+  const [newName, setNewName] = useState("");
+  const [claimSelf, setClaimSelf] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [createErr, setCreateErr] = useState("");
+  const [created, setCreated] = useState(null); // { name, link, claimed }
+  const [createdCopied, setCreatedCopied] = useState(false);
+
+  const [groups, setGroups] = useState(null);
+  const link = groupUrl(slug);
+
+  useEffect(() => {
+    let live = true;
+    onListGroups().then((g) => live && setGroups(g));
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const copyLink = () => {
+    navigator.clipboard?.writeText(link).then(() => {
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 1500);
+    });
+  };
+
+  const create = async () => {
+    if (!newName.trim()) return;
+    setCreating(true);
+    setCreateErr("");
+    const res = await onCreateGroup(newName, claimSelf);
+    setCreating(false);
+    if (res && res.error) {
+      setCreateErr(res.error);
+      return;
+    }
+    setCreated({ name: res.name, link: res.link, claimed: res.claimed });
+    setNewName("");
+  };
+
+  const copyCreated = () => {
+    if (!created) return;
+    navigator.clipboard?.writeText(created.link).then(() => {
+      setCreatedCopied(true);
+      setTimeout(() => setCreatedCopied(false), 1500);
+    });
+  };
+
+  return (
+    <div className="mt-4 space-y-4">
+      {/* This group */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900 p-4">
+        <div className="text-xs uppercase tracking-widest text-stone-500 mb-2">This group</div>
+        <label className="text-[11px] uppercase tracking-widest text-stone-500">Group name</label>
+        <div className="mt-1 flex gap-2">
+          <input
+            value={nameVal}
+            onChange={(e) => setNameVal(e.target.value)}
+            placeholder="e.g. Sunday Run"
+            className="flex-1 rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none focus:border-orange-500"
+          />
+          <button
+            onClick={() => {
+              onSetGroupName(nameVal.trim());
+              setNameSaved(true);
+              setTimeout(() => setNameSaved(false), 1500);
+            }}
+            className="px-4 rounded-lg bg-orange-500 text-stone-950 text-sm font-semibold hover:bg-orange-400"
+          >
+            {nameSaved ? "Saved ✓" : "Save"}
+          </button>
+        </div>
+        <div className="mt-3">
+          <label className="text-[11px] uppercase tracking-widest text-stone-500">Share link</label>
+          <div className="mt-1 flex gap-2">
+            <div className="flex-1 truncate rounded-lg bg-stone-950/60 border border-stone-800 px-3 py-2 text-xs text-stone-400">
+              {link}
+            </div>
+            <button
+              onClick={copyLink}
+              className="px-4 rounded-lg bg-stone-800 text-stone-200 text-sm font-semibold hover:bg-stone-700"
+            >
+              {linkCopied ? "Copied ✓" : "Copy"}
+            </button>
+          </div>
+          <p className="mt-1 text-[11px] text-stone-500">Send this to this group's players.</p>
+        </div>
+      </div>
+
+      {/* Create a new group */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900 p-4">
+        <div className="text-xs uppercase tracking-widest text-stone-500 mb-2">New group</div>
+
+        {created ? (
+          <div>
+            <div className="rounded-lg border border-emerald-800 bg-emerald-950/30 p-3">
+              <div className="text-sm font-semibold text-emerald-300">
+                Created "{created.name}" ✓
+              </div>
+              <div className="mt-2 text-[11px] uppercase tracking-widest text-stone-500">
+                Share link
+              </div>
+              <div className="mt-1 flex gap-2">
+                <div className="flex-1 truncate rounded-lg bg-stone-950/60 border border-stone-800 px-3 py-2 text-xs text-stone-300">
+                  {created.link}
+                </div>
+                <button
+                  onClick={copyCreated}
+                  className="px-4 rounded-lg bg-orange-500 text-stone-950 text-sm font-semibold hover:bg-orange-400"
+                >
+                  {createdCopied ? "Copied ✓" : "Copy"}
+                </button>
+              </div>
+              {created.claimed ? (
+                <div className="mt-2 text-[11px] text-stone-400">
+                  You manage this group. Send the link to its players so they can view standings.
+                </div>
+              ) : (
+                <div className="mt-2 text-[11px] text-stone-400">
+                  Left unclaimed for another manager. Send them this link — they tap{" "}
+                  <b className="text-stone-200">Manage</b>, sign in with their email, and{" "}
+                  <b className="text-stone-200">Claim this group</b>. It's then theirs alone.
+                </div>
+              )}
+            </div>
+            <div className="mt-3 flex gap-2">
+              {created.claimed && (
+                <button
+                  onClick={() => {
+                    window.location.search = created.link.includes("?g=")
+                      ? "?g=" + created.link.split("?g=")[1]
+                      : "";
+                  }}
+                  className="flex-1 rounded-lg bg-stone-800 text-stone-200 py-2 text-sm font-semibold hover:bg-stone-700"
+                >
+                  Open group
+                </button>
+              )}
+              <button
+                onClick={() => setCreated(null)}
+                className="flex-1 rounded-lg border border-stone-700 text-stone-300 py-2 text-sm font-semibold hover:bg-stone-800"
+              >
+                Create another
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <p className="text-xs text-stone-400 mb-3">
+              Starts a fresh, blank board with its own roster, sessions, and share link.
+            </p>
+            <div className="space-y-2">
+              <input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="Group name (e.g. Eastside)"
+                className="w-full rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none focus:border-orange-500"
+              />
+              <div>
+                <div className="text-[11px] uppercase tracking-widest text-stone-500 mb-1">
+                  Who manages it?
+                </div>
+                <div className="flex gap-1 rounded-lg bg-stone-800 p-1 text-xs">
+                  <button
+                    onClick={() => setClaimSelf(true)}
+                    className={`flex-1 rounded-md py-1.5 font-semibold ${
+                      claimSelf ? "bg-orange-500 text-stone-950" : "text-stone-400"
+                    }`}
+                  >
+                    Me
+                  </button>
+                  <button
+                    onClick={() => setClaimSelf(false)}
+                    className={`flex-1 rounded-md py-1.5 font-semibold ${
+                      !claimSelf ? "bg-orange-500 text-stone-950" : "text-stone-400"
+                    }`}
+                  >
+                    Another person
+                  </button>
+                </div>
+                <p className="mt-1 text-[11px] text-stone-500">
+                  {claimSelf
+                    ? "You'll own it and can edit right away."
+                    : "Left unclaimed — send the link and they claim it after signing in."}
+                </p>
+              </div>
+              <button
+                onClick={create}
+                disabled={!newName.trim() || creating}
+                className="w-full rounded-lg bg-orange-500 text-stone-950 py-2.5 text-sm font-bold hover:bg-orange-400 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {creating ? "Creating…" : "Create group"}
+              </button>
+              {createErr && <p className="text-xs text-rose-400">{createErr}</p>}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Switch group */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900 p-4">
+        <div className="text-xs uppercase tracking-widest text-stone-500 mb-2">Switch group</div>
+        {groups === null ? (
+          <p className="text-xs text-stone-500">Loading your groups…</p>
+        ) : groups.length <= 1 ? (
+          <p className="text-xs text-stone-500">You only have one group so far.</p>
+        ) : (
+          <div className="space-y-2">
+            {groups.map((g) => {
+              const current = g.slug === slug;
+              return (
+                <button
+                  key={g.slug}
+                  disabled={current}
+                  onClick={() => {
+                    window.location.search = g.slug === "main" ? "" : "?g=" + g.slug;
+                  }}
+                  className={`w-full flex items-center justify-between rounded-lg border px-3 py-2 text-sm ${
+                    current
+                      ? "border-orange-500/40 bg-stone-950/40 text-stone-400 cursor-default"
+                      : "border-stone-700 bg-stone-800 text-stone-200 hover:bg-stone-700"
+                  }`}
+                >
+                  <span className="font-semibold">{g.name}</span>
+                  <span className="text-[11px] text-stone-500">{current ? "current" : "open →"}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <p className="mt-2 text-[11px] text-stone-500">
+          Shows only the groups you manage. Managing another still uses your same sign-in.
+        </p>
+      </div>
+
+      {/* Account */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900 p-4">
+        <div className="text-xs uppercase tracking-widest text-stone-500 mb-2">Account</div>
+        <div className="flex items-center justify-between gap-3">
+          <div className="text-xs text-stone-400 truncate">
+            Signed in as <span className="text-stone-200">{email || "—"}</span>
+          </div>
+          <button
+            onClick={onSignOut}
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-stone-800 text-stone-200 hover:bg-stone-700"
+          >
+            Sign out
+          </button>
+        </div>
       </div>
     </div>
   );
