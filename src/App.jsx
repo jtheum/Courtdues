@@ -45,16 +45,12 @@ const timeRange = (s) => {
   return s.endTime ? `${prettyTime(s.time)} – ${prettyTime(s.endTime)}` : prettyTime(s.time);
 };
 
-// per-session math: new sessions store totalCost split across attendees;
-// legacy sessions stored a per-player "cost" — fall back to that.
+// Flat charge per player. Set from the board's rate at render time (default $10),
+// with an optional per-session override via s.rate. Does NOT change with headcount.
+let BOARD_RATE = 10;
 const attCount = (s) => (s.attendees || []).length;
-const perPlayer = (s) => {
-  if (s.totalCost != null) {
-    const n = attCount(s);
-    return n > 0 ? num(s.totalCost) / n : num(s.totalCost);
-  }
-  return num(s.cost);
-};
+const perPlayer = (s) => (s.rate != null ? num(s.rate) : BOARD_RATE);
+// What the court actually cost you that night (your outlay).
 const sessionTotal = (s) => {
   if (s.totalCost != null) return num(s.totalCost);
   return num(s.cost) * attCount(s);
@@ -199,6 +195,9 @@ export default function CourtDues() {
     }
   };
 
+  // Flat per-player rate for this board (default $10). Set before any perPlayer call.
+  BOARD_RATE = data && data.rate != null ? num(data.rate) : 10;
+
   // ---- derived totals ----
   const totals = useMemo(() => {
     const owedBy = {};
@@ -222,7 +221,15 @@ export default function CourtDues() {
     rows.sort((a, b) => b.balance - a.balance || a.name.localeCompare(b.name));
     const collected = rows.reduce((s, r) => s + r.paid, 0);
     const billed = rows.reduce((s, r) => s + r.owed, 0);
-    return { rows, collected, billed, outstanding: billed - collected };
+    const courtCosts = data.sessions.reduce((s, sess) => s + sessionTotal(sess), 0);
+    return {
+      rows,
+      collected,
+      billed,
+      outstanding: billed - collected,
+      courtCosts,
+      extra: collected - courtCosts, // cash in hand beyond what courts cost you
+    };
   }, [data]);
 
   const nextGame = useMemo(() => {
@@ -327,6 +334,7 @@ export default function CourtDues() {
     persist({ ...data, courts: data.courts.filter((c) => c.id !== id) });
 
   const setGroupName = (name) => persist({ ...data, name });
+  const setRate = (r) => persist({ ...data, rate: Math.max(0, num(r)) });
 
   const displayName = data.name || (SLUG === "main" ? "Main" : SLUG);
 
@@ -502,7 +510,16 @@ export default function CourtDues() {
 
             {viewTab === "sessions" && (
               <>
-                <NextGameCard game={nextGame} />
+                <NextGameCard game={nextGame} sessionCount={data.sessions.length} />
+                <div className="mt-4 grid grid-cols-3 gap-2">
+                  <Stat label="Collected" value={money(totals.collected)} tone="emerald" />
+                  <Stat label="Left" value={money(totals.outstanding)} tone="orange" />
+                  <Stat
+                    label="Extra"
+                    value={money(totals.extra)}
+                    tone={totals.extra >= 0 ? "sky" : "orange"}
+                  />
+                </div>
                 <div className="mt-4 flex items-center justify-between">
                   <h2 className="text-xs uppercase tracking-widest text-stone-500">
                     Who owes what
@@ -568,7 +585,11 @@ export default function CourtDues() {
               <SessionsManager
                 players={data.players}
                 courts={data.courts}
-                sessions={[...data.sessions].sort((a, b) => (b.date || "").localeCompare(a.date || ""))}
+                sessions={[...data.sessions].sort(
+                  (a, b) =>
+                    (a.date || "").localeCompare(b.date || "") ||
+                    (a.time || "").localeCompare(b.time || "")
+                )}
                 onAdd={addSession}
                 onUpdate={updateSession}
                 onRemove={removeSession}
@@ -590,6 +611,8 @@ export default function CourtDues() {
                 slug={SLUG}
                 groupName={displayName}
                 onSetGroupName={setGroupName}
+                rate={data.rate != null ? data.rate : 10}
+                onSetRate={setRate}
                 onCreateGroup={createGroup}
                 onListGroups={listGroups}
                 email={session && session.user && session.user.email}
@@ -611,7 +634,7 @@ export default function CourtDues() {
 
 /* ---------- View pieces ---------- */
 
-function NextGameCard({ game }) {
+function NextGameCard({ game, sessionCount = 0 }) {
   if (!game)
     return (
       <div className="mt-5 rounded-2xl border border-dashed border-stone-800 bg-stone-900/40 p-5 text-center">
@@ -619,6 +642,7 @@ function NextGameCard({ game }) {
       </div>
     );
   const share = perPlayer(game);
+  const fullRun = share * sessionCount;
   return (
     <div className="mt-5 rounded-2xl border border-orange-500/30 bg-gradient-to-br from-stone-900 to-stone-900/40 p-5">
       <div className="flex items-center gap-2">
@@ -637,25 +661,36 @@ function NextGameCard({ game }) {
           <span>{game.place}</span>
         </div>
       )}
-      <div className="mt-3 flex items-center gap-2">
+      <div className="mt-3 flex items-center gap-2 flex-wrap">
         <div className="inline-flex items-baseline gap-1 rounded-lg bg-stone-950/60 px-3 py-1.5">
           <span className="font-mono text-lg font-bold text-orange-400">{money(share)}</span>
           <span className="text-xs text-stone-500">/ player</span>
         </div>
-        <div className="text-[11px] text-stone-500">
-          {attCount(game)} player{attCount(game) === 1 ? "" : "s"} in
-        </div>
+        {sessionCount > 0 && (
+          <div className="text-[11px] text-stone-500">
+            × {sessionCount} session{sessionCount === 1 ? "" : "s"} ={" "}
+            <span className="font-mono text-stone-300">{money(fullRun)}</span> full run
+          </div>
+        )}
+      </div>
+      <div className="mt-1.5 text-[11px] text-stone-500">
+        {attCount(game)} player{attCount(game) === 1 ? "" : "s"} in for this one
       </div>
     </div>
   );
 }
 
 function Stat({ label, value, tone }) {
-  const color = tone === "emerald" ? "text-emerald-400" : "text-orange-400";
+  const color =
+    tone === "emerald"
+      ? "text-emerald-400"
+      : tone === "sky"
+      ? "text-sky-400"
+      : "text-orange-400";
   return (
     <div className="rounded-xl border border-stone-800 bg-stone-900 p-3">
       <div className="text-[11px] uppercase tracking-widest text-stone-500">{label}</div>
-      <div className={`mt-1 font-mono text-xl font-bold ${color}`}>{value}</div>
+      <div className={`mt-1 font-mono text-lg font-bold ${color}`}>{value}</div>
     </div>
   );
 }
@@ -914,7 +949,10 @@ function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
     [players, sessions, payments]
   );
   const pmap = Object.fromEntries(players.map((p) => [p.id, p.name]));
-  const sorted = [...sessions].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const sorted = [...sessions].sort(
+    (a, b) =>
+      (a.date || "").localeCompare(b.date || "") || (a.time || "").localeCompare(b.time || "")
+  );
 
   if (sorted.length === 0) return <EmptyNote text="No sessions logged yet." />;
 
@@ -1303,8 +1341,9 @@ function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove,
   );
   const canSaveCourt = place.trim() && num(totalCost) > 0 && !nameMatchesCourt;
 
-  const share =
-    attendees.length && num(totalCost) > 0 ? num(totalCost) / attendees.length : 0;
+  const rate = BOARD_RATE;
+  const collectAtRate = rate * attendees.length;
+  const sessionExtra = collectAtRate - num(totalCost);
 
   const save = () => {
     if (!date || num(totalCost) <= 0) return;
@@ -1425,10 +1464,22 @@ function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove,
           )}
         </div>
 
-        {share > 0 && (
+        {attendees.length > 0 && (
           <div className="mt-3 text-xs text-stone-400">
-            Split ={" "}
-            <span className="font-mono font-bold text-orange-400">{money(share)}</span> / player
+            <span className="font-mono font-bold text-orange-400">{money(rate)}</span>/player ×{" "}
+            {attendees.length} = <span className="font-mono">{money(collectAtRate)}</span>
+            {num(totalCost) > 0 && (
+              <>
+                {" · court "}
+                {money(num(totalCost))}
+                {" · extra "}
+                <span
+                  className={`font-mono ${sessionExtra >= 0 ? "text-sky-400" : "text-orange-400"}`}
+                >
+                  {money(sessionExtra)}
+                </span>
+              </>
+            )}
           </div>
         )}
 
@@ -1823,9 +1874,11 @@ function AuthGate({ session, isManager, boardUnclaimed, groupName, onClaim, onSi
   );
 }
 
-function SettingsPanel({ slug, groupName, onSetGroupName, onCreateGroup, onListGroups, email, onSignOut }) {
+function SettingsPanel({ slug, groupName, onSetGroupName, rate, onSetRate, onCreateGroup, onListGroups, email, onSignOut }) {
   const [nameVal, setNameVal] = useState(groupName || "");
   const [nameSaved, setNameSaved] = useState(false);
+  const [rateVal, setRateVal] = useState(String(rate));
+  const [rateSaved, setRateSaved] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
 
   const [newName, setNewName] = useState("");
@@ -1913,6 +1966,36 @@ function SettingsPanel({ slug, groupName, onSetGroupName, onCreateGroup, onListG
             </button>
           </div>
           <p className="mt-1 text-[11px] text-stone-500">Send this to this group's players.</p>
+        </div>
+        <div className="mt-3">
+          <label className="text-[11px] uppercase tracking-widest text-stone-500">
+            Charge per player
+          </label>
+          <div className="mt-1 flex gap-2">
+            <div className="flex items-center rounded-lg bg-stone-800 border border-stone-700 px-3 flex-1">
+              <span className="text-stone-500 text-sm">$</span>
+              <input
+                type="number"
+                inputMode="decimal"
+                value={rateVal}
+                onChange={(e) => setRateVal(e.target.value)}
+                className="w-full bg-transparent py-2 pl-1 text-sm outline-none"
+              />
+            </div>
+            <button
+              onClick={() => {
+                onSetRate(rateVal);
+                setRateSaved(true);
+                setTimeout(() => setRateSaved(false), 1500);
+              }}
+              className="px-4 rounded-lg bg-orange-500 text-stone-950 text-sm font-semibold hover:bg-orange-400"
+            >
+              {rateSaved ? "Saved ✓" : "Save"}
+            </button>
+          </div>
+          <p className="mt-1 text-[11px] text-stone-500">
+            Flat amount each player owes per session, no matter how many show up.
+          </p>
         </div>
       </div>
 
