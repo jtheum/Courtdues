@@ -339,6 +339,7 @@ export default function CourtDues() {
 
   const setGroupName = (name) => persist({ ...data, name });
   const setRate = (r) => persist({ ...data, rate: Math.max(0, num(r)) });
+  const setPay = (patch) => persist({ ...data, pay: { ...(data.pay || {}), ...patch } });
 
   const displayName = data.name || (SLUG === "main" ? "Main" : SLUG);
 
@@ -424,6 +425,15 @@ export default function CourtDues() {
     });
     lines.push("");
     lines.push(`Outstanding total: ${money(totals.outstanding)}`);
+    const pay = data.pay || {};
+    const payParts = [];
+    if (pay.venmo) payParts.push(`Venmo @${pay.venmo.replace(/^@/, "")}`);
+    if (pay.cashapp) payParts.push(`Cash App $${pay.cashapp.replace(/^\$/, "")}`);
+    if (pay.applepay) payParts.push(`Apple Cash ${pay.applepay}`);
+    if (payParts.length) {
+      lines.push("");
+      lines.push(`Pay: ${payParts.join(" · ")}`);
+    }
     const text = lines.join("\n");
     navigator.clipboard?.writeText(text).then(
       () => {
@@ -511,6 +521,8 @@ export default function CourtDues() {
                 </button>
               ))}
             </div>
+
+            <PayLinks pay={data.pay} />
 
             {viewTab === "sessions" && (
               <>
@@ -613,6 +625,8 @@ export default function CourtDues() {
                 onSetGroupName={setGroupName}
                 rate={data.rate != null ? data.rate : 10}
                 onSetRate={setRate}
+                pay={data.pay || {}}
+                onSetPay={setPay}
                 onCreateGroup={createGroup}
                 onListGroups={listGroups}
                 email={session && session.user && session.user.email}
@@ -676,6 +690,63 @@ function NextGameCard({ game, sessionCount = 0 }) {
       <div className="mt-1.5 text-[11px] text-stone-500">
         {attCount(game)} player{attCount(game) === 1 ? "" : "s"} in for this one
       </div>
+    </div>
+  );
+}
+
+function PayLinks({ pay }) {
+  const [copied, setCopied] = useState("");
+  if (!pay) return null;
+  const venmo = (pay.venmo || "").replace(/^@/, "").trim();
+  const cashapp = (pay.cashapp || "").replace(/^\$/, "").trim();
+  const apple = (pay.applepay || "").trim();
+  if (!venmo && !cashapp && !apple) return null;
+
+  const copy = (val, key) => {
+    navigator.clipboard?.writeText(val).then(() => {
+      setCopied(key);
+      setTimeout(() => setCopied(""), 1500);
+    });
+  };
+
+  return (
+    <div className="mt-4 rounded-xl border border-stone-800 bg-stone-900 p-3">
+      <div className="text-[11px] uppercase tracking-widest text-stone-500 mb-2">Pay your dues</div>
+      <div className="flex flex-wrap gap-2">
+        {venmo && (
+          <a
+            href={`https://venmo.com/u/${venmo}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-sky-600 text-white hover:bg-sky-500"
+          >
+            Venmo
+          </a>
+        )}
+        {cashapp && (
+          <a
+            href={`https://cash.app/$${cashapp}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-600 text-white hover:bg-emerald-500"
+          >
+            Cash App
+          </a>
+        )}
+        {apple && (
+          <button
+            onClick={() => copy(apple, "apple")}
+            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-stone-700 text-stone-100 hover:bg-stone-600"
+          >
+            {copied === "apple" ? "Copied ✓" : `Apple Cash: ${apple}`}
+          </button>
+        )}
+      </div>
+      {apple && (
+        <p className="mt-1.5 text-[11px] text-stone-500">
+          Apple Cash: send to that number/email in Messages.
+        </p>
+      )}
     </div>
   );
 }
@@ -1882,11 +1953,15 @@ function AuthGate({ session, isManager, boardUnclaimed, groupName, onClaim, onSi
   );
 }
 
-function SettingsPanel({ slug, groupName, onSetGroupName, rate, onSetRate, onCreateGroup, onListGroups, email, onSignOut }) {
+function SettingsPanel({ slug, groupName, onSetGroupName, rate, onSetRate, pay, onSetPay, onCreateGroup, onListGroups, email, onSignOut }) {
   const [nameVal, setNameVal] = useState(groupName || "");
   const [nameSaved, setNameSaved] = useState(false);
   const [rateVal, setRateVal] = useState(String(rate));
   const [rateSaved, setRateSaved] = useState(false);
+  const [venmoVal, setVenmoVal] = useState((pay && pay.venmo) || "");
+  const [cashVal, setCashVal] = useState((pay && pay.cashapp) || "");
+  const [appleVal, setAppleVal] = useState((pay && pay.applepay) || "");
+  const [paySaved, setPaySaved] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
 
   const [newName, setNewName] = useState("");
@@ -2003,6 +2078,62 @@ function SettingsPanel({ slug, groupName, onSetGroupName, rate, onSetRate, onCre
           </div>
           <p className="mt-1 text-[11px] text-stone-500">
             Flat amount each player owes per session, no matter how many show up.
+          </p>
+        </div>
+      </div>
+
+      {/* Payment links */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900 p-4">
+        <div className="text-xs uppercase tracking-widest text-stone-500 mb-2">Payment links</div>
+        <p className="text-xs text-stone-400 mb-3">
+          Shown to players so they can pay you. Leave any blank to hide it.
+        </p>
+        <div className="space-y-2">
+          <div className="flex items-center rounded-lg bg-stone-800 border border-stone-700 px-3">
+            <span className="text-stone-500 text-sm w-16 shrink-0">Venmo</span>
+            <span className="text-stone-500 text-sm">@</span>
+            <input
+              value={venmoVal}
+              onChange={(e) => setVenmoVal(e.target.value)}
+              placeholder="username"
+              className="w-full bg-transparent py-2 pl-1 text-sm outline-none"
+            />
+          </div>
+          <div className="flex items-center rounded-lg bg-stone-800 border border-stone-700 px-3">
+            <span className="text-stone-500 text-sm w-16 shrink-0">Cash App</span>
+            <span className="text-stone-500 text-sm">$</span>
+            <input
+              value={cashVal}
+              onChange={(e) => setCashVal(e.target.value)}
+              placeholder="cashtag"
+              className="w-full bg-transparent py-2 pl-1 text-sm outline-none"
+            />
+          </div>
+          <div className="flex items-center rounded-lg bg-stone-800 border border-stone-700 px-3">
+            <span className="text-stone-500 text-sm w-16 shrink-0">Apple</span>
+            <input
+              value={appleVal}
+              onChange={(e) => setAppleVal(e.target.value)}
+              placeholder="phone or email for Apple Cash"
+              className="w-full bg-transparent py-2 pl-1 text-sm outline-none"
+            />
+          </div>
+          <button
+            onClick={() => {
+              onSetPay({
+                venmo: venmoVal.trim(),
+                cashapp: cashVal.trim(),
+                applepay: appleVal.trim(),
+              });
+              setPaySaved(true);
+              setTimeout(() => setPaySaved(false), 1500);
+            }}
+            className="w-full rounded-lg bg-orange-500 text-stone-950 py-2 text-sm font-semibold hover:bg-orange-400"
+          >
+            {paySaved ? "Saved ✓" : "Save payment links"}
+          </button>
+          <p className="text-[11px] text-stone-500">
+            Apple Cash has no web link — it shows as a tap-to-copy handle players send in Messages.
           </p>
         </div>
       </div>
