@@ -222,13 +222,17 @@ export default function CourtDues() {
     const collected = rows.reduce((s, r) => s + r.paid, 0);
     const billed = rows.reduce((s, r) => s + r.owed, 0);
     const courtCosts = data.sessions.reduce((s, sess) => s + sessionTotal(sess), 0);
+    const owedToYou = rows.reduce((s, r) => s + Math.max(0, r.balance), 0);
     return {
       rows,
       collected,
       billed,
       outstanding: billed - collected,
+      owedToYou,
       courtCosts,
-      extra: collected - courtCosts, // cash in hand beyond what courts cost you
+      // Split around what the courts cost you: still-needed below, surplus above.
+      uncollected: Math.max(0, courtCosts - collected),
+      extra: Math.max(0, collected - courtCosts),
     };
   }, [data]);
 
@@ -513,12 +517,8 @@ export default function CourtDues() {
                 <NextGameCard game={nextGame} sessionCount={data.sessions.length} />
                 <div className="mt-4 grid grid-cols-3 gap-2">
                   <Stat label="Collected" value={money(totals.collected)} tone="emerald" />
-                  <Stat label="Left" value={money(totals.outstanding)} tone="orange" />
-                  <Stat
-                    label="Extra"
-                    value={money(totals.extra)}
-                    tone={totals.extra >= 0 ? "sky" : "orange"}
-                  />
+                  <Stat label="Uncollected" value={money(totals.uncollected)} tone="orange" />
+                  <Stat label="Extra" value={money(totals.extra)} tone="sky" />
                 </div>
                 <div className="mt-4 flex items-center justify-between">
                   <h2 className="text-xs uppercase tracking-widest text-stone-500">
