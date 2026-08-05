@@ -700,6 +700,8 @@ function PayLinks({ pay }) {
   const venmo = (pay.venmo || "").replace(/^@/, "").trim();
   const cashapp = (pay.cashapp || "").replace(/^\$/, "").trim();
   const apple = (pay.applepay || "").trim();
+  const appleIsPhone = apple && !apple.includes("@") && /\d/.test(apple);
+  const appleTel = apple.replace(/[^\d+]/g, "");
   if (!venmo && !cashapp && !apple) return null;
 
   const copy = (val, key) => {
@@ -733,18 +735,28 @@ function PayLinks({ pay }) {
             Cash App
           </a>
         )}
-        {apple && (
-          <button
-            onClick={() => copy(apple, "apple")}
-            className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-stone-700 text-stone-100 hover:bg-stone-600"
-          >
-            {copied === "apple" ? "Copied ✓" : `Apple Cash: ${apple}`}
-          </button>
-        )}
+        {apple &&
+          (appleIsPhone ? (
+            <a
+              href={`sms:${appleTel}`}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-stone-700 text-stone-100 hover:bg-stone-600"
+            >
+              Apple Cash
+            </a>
+          ) : (
+            <button
+              onClick={() => copy(apple, "apple")}
+              className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-stone-700 text-stone-100 hover:bg-stone-600"
+            >
+              {copied === "apple" ? "Copied ✓" : `Apple Cash: ${apple}`}
+            </button>
+          ))}
       </div>
       {apple && (
         <p className="mt-1.5 text-[11px] text-stone-500">
-          Apple Cash: send to that number/email in Messages.
+          {appleIsPhone
+            ? "Apple Cash opens Messages to that number — tap the Apple Cash icon and enter the amount."
+            : "Apple Cash: send to that email in Messages."}
         </p>
       )}
     </div>
