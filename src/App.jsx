@@ -984,12 +984,12 @@ function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
                 </div>
               </div>
               <div className="text-right shrink-0">
-                {att.length > 0 && dueTotal < 0.001 ? (
-                  <span className="text-xs font-semibold text-emerald-400">all paid ✓</span>
-                ) : isUpcoming ? (
+                {isUpcoming ? (
                   att.length > 0 ? (
                     <span className="text-[11px] text-stone-500">upcoming</span>
                   ) : null
+                ) : att.length > 0 && dueTotal < 0.001 ? (
+                  <span className="text-xs font-semibold text-emerald-400">all paid ✓</span>
                 ) : dueTotal > 0.001 ? (
                   <span className="font-mono text-sm font-bold text-orange-400">
                     {money(dueTotal)} due
