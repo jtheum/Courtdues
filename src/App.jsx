@@ -961,10 +961,12 @@ function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
       {sorted.map((s) => {
         const att = (s.attendees || []).filter((pid) => pmap[pid]);
         const share = perPlayer(s);
-        const dueTotal = att.reduce((sum, pid) => {
-          const d = coverage[pid] && coverage[pid].bySession[s.id];
-          return sum + (d || 0);
-        }, 0);
+        const isUpcoming = !!(s.date && s.date >= todayISO());
+        const dueFor = (pid) => {
+          const cov = coverage[pid];
+          return cov && cov.bySession[s.id] != null ? cov.bySession[s.id] : share;
+        };
+        const dueTotal = att.reduce((sum, pid) => sum + dueFor(pid), 0);
         const isOpen = open === s.id;
         return (
           <div key={s.id} className="rounded-xl border border-stone-800 bg-stone-900">
@@ -982,7 +984,11 @@ function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
                 </div>
               </div>
               <div className="text-right shrink-0">
-                {att.length > 0 && dueTotal < 0.001 ? (
+                {isUpcoming ? (
+                  att.length > 0 ? (
+                    <span className="text-[11px] text-stone-500">upcoming</span>
+                  ) : null
+                ) : att.length > 0 && dueTotal < 0.001 ? (
                   <span className="text-xs font-semibold text-emerald-400">all paid ✓</span>
                 ) : dueTotal > 0.001 ? (
                   <span className="font-mono text-sm font-bold text-orange-400">
@@ -1003,7 +1009,7 @@ function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
                   ) : (
                     players.map((p) => {
                       const inSession = (s.attendees || []).includes(p.id);
-                      const due = (coverage[p.id] && coverage[p.id].bySession[s.id]) || 0;
+                      const due = dueFor(p.id);
                       const paid = due < 0.001;
                       return (
                         <button
@@ -1028,13 +1034,15 @@ function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
                           {inSession && (
                             <span className="flex items-baseline gap-2 shrink-0">
                               <span className="font-mono text-stone-400">{money(share)}</span>
-                              <span
-                                className={`text-[11px] font-semibold ${
-                                  paid ? "text-emerald-400" : "text-orange-400"
-                                }`}
-                              >
-                                {paid ? "paid ✓" : `${money(due)} due`}
-                              </span>
+                              {!isUpcoming && (
+                                <span
+                                  className={`text-[11px] font-semibold ${
+                                    paid ? "text-emerald-400" : "text-orange-400"
+                                  }`}
+                                >
+                                  {paid ? "paid ✓" : `${money(due)} due`}
+                                </span>
+                              )}
                             </span>
                           )}
                         </button>
