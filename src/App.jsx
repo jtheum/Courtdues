@@ -78,7 +78,7 @@ export default function CourtDues() {
   const [isManager, setIsManager] = useState(false);
   const [boardUnclaimed, setBoardUnclaimed] = useState(false);
   const [tab, setTab] = useState("roster"); // roster | sessions | courts | settings
-  const [viewTab, setViewTab] = useState("standings"); // standings | upcoming
+  const [viewTab, setViewTab] = useState("sessions"); // sessions | upcoming
   const [copied, setCopied] = useState(false);
 
   // ---- load + live updates ----
@@ -257,6 +257,11 @@ export default function CourtDues() {
       payments: [...data.payments, { id: uid(), playerId, amount: amt, date: todayISO() }],
     });
   };
+  const toggleRegular = (id) =>
+    persist({
+      ...data,
+      players: data.players.map((p) => (p.id === id ? { ...p, regular: !p.regular } : p)),
+    });
   const addSession = (s) =>
     persist({ ...data, sessions: [...data.sessions, { id: uid(), ...s }] });
   const updateSession = (id, patch) =>
@@ -266,6 +271,36 @@ export default function CourtDues() {
     });
   const removeSession = (id) =>
     persist({ ...data, sessions: data.sessions.filter((s) => s.id !== id) });
+
+  // Attendance is the one thing viewers (not signed in) may change. It uses a
+  // plain UPDATE (not upsert) so anonymous writers are allowed by the DB guard,
+  // which permits attendance-only changes and blocks any money edits.
+  const toggleAttendee = async (sessionId, playerId) => {
+    const next = {
+      ...data,
+      sessions: data.sessions.map((s) =>
+        s.id === sessionId
+          ? {
+              ...s,
+              attendees: (s.attendees || []).includes(playerId)
+                ? (s.attendees || []).filter((x) => x !== playerId)
+                : [...(s.attendees || []), playerId],
+            }
+          : s
+      ),
+    };
+    setData(next); // optimistic
+    try {
+      const { error } = await supabase
+        .from("boards")
+        .update({ data: next, updated_at: new Date().toISOString() })
+        .eq("slug", SLUG);
+      if (error) throw error;
+      setSaveErr("");
+    } catch (e) {
+      setSaveErr("Couldn't update attendance — someone may have just changed something. Try again.");
+    }
+  };
   const duplicateSession = (id) => {
     const s = data.sessions.find((x) => x.id === id);
     if (!s) return;
@@ -450,7 +485,7 @@ export default function CourtDues() {
             <InstallPrompt />
             <div className="mt-5 flex gap-1 rounded-xl bg-stone-900 p-1 text-sm">
               {[
-                ["standings", "Standings"],
+                ["sessions", "Sessions"],
                 ["upcoming", "Upcoming"],
               ].map(([k, label]) => (
                 <button
@@ -465,16 +500,13 @@ export default function CourtDues() {
               ))}
             </div>
 
-            {viewTab === "standings" && (
+            {viewTab === "sessions" && (
               <>
                 <NextGameCard game={nextGame} />
-                <div className="mt-4 grid grid-cols-2 gap-3">
-                  <Stat label="Collected" value={money(totals.collected)} tone="emerald" />
-                  <Stat label="Outstanding" value={money(totals.outstanding)} tone="orange" />
-                </div>
-
-                <div className="mt-6 flex items-center justify-between">
-                  <h2 className="text-xs uppercase tracking-widest text-stone-500">Standings</h2>
+                <div className="mt-4 flex items-center justify-between">
+                  <h2 className="text-xs uppercase tracking-widest text-stone-500">
+                    Who owes what
+                  </h2>
                   <button
                     onClick={copyStandings}
                     className="text-xs font-semibold text-orange-400 hover:text-orange-300"
@@ -482,14 +514,13 @@ export default function CourtDues() {
                     {copied ? "Copied ✓" : "Copy for group chat"}
                   </button>
                 </div>
-
-                <div className="mt-3 space-y-2">
-                  {totals.rows.length === 0 && (
-                    <EmptyNote text="No players yet. Tap Manage to add your squad." />
-                  )}
-                  {totals.rows.map((r) => (
-                    <StandingRow key={r.id} r={r} />
-                  ))}
+                <div className="mt-3">
+                  <SessionsBreakdown
+                    sessions={data.sessions}
+                    players={data.players}
+                    payments={data.payments}
+                    onToggleAttendee={toggleAttendee}
+                  />
                 </div>
               </>
             )}
@@ -528,6 +559,9 @@ export default function CourtDues() {
                 onAdd={addPlayer}
                 onRemove={removePlayer}
                 onPay={recordPayment}
+                onToggleRegular={toggleRegular}
+                fronted={totals.billed}
+                collected={totals.collected}
               />
             )}
             {tab === "sessions" && (
@@ -626,14 +660,20 @@ function Stat({ label, value, tone }) {
   );
 }
 
-function StandingRow({ r }) {
+function StandingRow({ r, open, onToggle }) {
   const pct = r.owed > 0 ? Math.min(100, (r.paid / r.owed) * 100) : r.paid > 0 ? 100 : 0;
   const square = Math.abs(r.balance) < 0.001;
   const credit = r.balance < -0.001;
   return (
-    <div className="rounded-xl border border-stone-800 bg-stone-900 p-3">
+    <button
+      onClick={onToggle}
+      className="w-full text-left rounded-xl border border-stone-800 bg-stone-900 p-3 hover:border-stone-700 transition-colors"
+    >
       <div className="flex items-center justify-between">
-        <span className="font-semibold">{r.name}</span>
+        <span className="font-semibold flex items-center gap-1.5">
+          {r.name}
+          <span className="text-stone-600 text-[10px]">{open ? "▲" : "▾"}</span>
+        </span>
         <span
           className={`font-mono font-bold ${
             square ? "text-emerald-400" : credit ? "text-sky-400" : "text-orange-400"
@@ -652,6 +692,102 @@ function StandingRow({ r }) {
         <span>paid {money(r.paid)}</span>
         <span>of {money(r.owed)}</span>
       </div>
+    </button>
+  );
+}
+
+function StandingsList({ rows, sessions, payments }) {
+  const [open, setOpen] = useState(null);
+  return (
+    <>
+      {rows.map((r) => (
+        <div key={r.id}>
+          <StandingRow
+            r={r}
+            open={open === r.id}
+            onToggle={() => setOpen(open === r.id ? null : r.id)}
+          />
+          {open === r.id && <PlayerDetail player={r} sessions={sessions} payments={payments} />}
+        </div>
+      ))}
+    </>
+  );
+}
+
+// Per-session breakdown for one player. Payments aren't tagged to a session,
+// so we apply each player's payments to their OLDEST sessions first to show
+// which nights are covered.
+function PlayerDetail({ player, sessions, payments }) {
+  const paidTotal = payments
+    .filter((p) => p.playerId === player.id)
+    .reduce((s, p) => s + num(p.amount), 0);
+  const attended = sessions
+    .filter((s) => (s.attendees || []).includes(player.id))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  let pool = paidTotal;
+  const lines = attended.map((s) => {
+    const share = perPlayer(s);
+    const covered = Math.min(Math.max(0, pool), share);
+    pool -= covered;
+    return { s, share, due: share - covered };
+  });
+  const owed = lines.reduce((a, l) => a + l.share, 0);
+  const balance = owed - paidTotal;
+  const creditLeft = Math.max(0, paidTotal - owed);
+
+  return (
+    <div className="mt-2 rounded-xl border border-stone-800 bg-stone-950/40 p-3">
+      <div className="text-[11px] uppercase tracking-widest text-stone-500 mb-2">Per session</div>
+      {lines.length === 0 ? (
+        <p className="text-xs text-stone-500">Not in any sessions yet.</p>
+      ) : (
+        <div>
+          {[...lines].reverse().map((l, i) => (
+            <div
+              key={i}
+              className="flex items-center justify-between py-1.5 border-b border-stone-800/60 last:border-0"
+            >
+              <div className="min-w-0">
+                <div className="text-sm text-stone-300">{prettyDate(l.s.date)}</div>
+                {l.s.place && (
+                  <div className="text-[11px] text-stone-500 truncate">{l.s.place}</div>
+                )}
+              </div>
+              <div className="text-right">
+                <div className="font-mono text-sm text-stone-300">{money(l.share)}</div>
+                <div className={`text-[11px] ${l.due < 0.001 ? "text-emerald-400" : "text-orange-400"}`}>
+                  {l.due < 0.001 ? "paid ✓" : `${money(l.due)} due`}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="mt-2 pt-2 border-t border-stone-800 flex items-center justify-between text-sm">
+        <span className="text-stone-400">
+          paid {money(paidTotal)} of {money(owed)}
+        </span>
+        <span
+          className={`font-mono font-bold ${
+            Math.abs(balance) < 0.001
+              ? "text-emerald-400"
+              : balance < 0
+              ? "text-sky-400"
+              : "text-orange-400"
+          }`}
+        >
+          {Math.abs(balance) < 0.001
+            ? "square"
+            : balance < 0
+            ? `credit ${money(-balance)}`
+            : `${money(balance)} due`}
+        </span>
+      </div>
+      {creditLeft > 0.001 && (
+        <div className="text-[11px] text-sky-400 mt-1">
+          {money(creditLeft)} prepaid credit remaining
+        </div>
+      )}
     </div>
   );
 }
@@ -747,6 +883,136 @@ function InstallPrompt() {
 
 /* ---------- Upcoming sessions (viewer) ---------- */
 
+// For each player, apply their payments to their OLDEST sessions first, so each
+// session knows how much that player still owes for that specific night.
+function computeCoverage(players, sessions, payments) {
+  const cov = {};
+  players.forEach((p) => {
+    const paid = payments
+      .filter((x) => x.playerId === p.id)
+      .reduce((a, b) => a + num(b.amount), 0);
+    const attended = sessions
+      .filter((s) => (s.attendees || []).includes(p.id))
+      .sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+    let pool = paid;
+    const bySession = {};
+    attended.forEach((s) => {
+      const share = perPlayer(s);
+      const covered = Math.min(Math.max(0, pool), share);
+      pool -= covered;
+      bySession[s.id] = share - covered;
+    });
+    cov[p.id] = { bySession, paid };
+  });
+  return cov;
+}
+
+function SessionsBreakdown({ sessions, players, payments, onToggleAttendee }) {
+  const [open, setOpen] = useState(null);
+  const coverage = useMemo(
+    () => computeCoverage(players, sessions, payments),
+    [players, sessions, payments]
+  );
+  const pmap = Object.fromEntries(players.map((p) => [p.id, p.name]));
+  const sorted = [...sessions].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+
+  if (sorted.length === 0) return <EmptyNote text="No sessions logged yet." />;
+
+  return (
+    <div className="space-y-2">
+      {sorted.map((s) => {
+        const att = (s.attendees || []).filter((pid) => pmap[pid]);
+        const share = perPlayer(s);
+        const dueTotal = att.reduce((sum, pid) => {
+          const d = coverage[pid] && coverage[pid].bySession[s.id];
+          return sum + (d || 0);
+        }, 0);
+        const isOpen = open === s.id;
+        return (
+          <div key={s.id} className="rounded-xl border border-stone-800 bg-stone-900">
+            <button
+              onClick={() => setOpen(isOpen ? null : s.id)}
+              className="w-full text-left p-3 flex items-center justify-between"
+            >
+              <div className="min-w-0">
+                <div className="font-semibold text-sm flex items-center gap-1.5">
+                  {prettyDate(s.date)}
+                  <span className="text-stone-600 text-[10px]">{isOpen ? "▲" : "▾"}</span>
+                </div>
+                <div className="text-[11px] text-stone-500 truncate">
+                  {s.place || "No place"} · {money(share)}/player · {att.length} in
+                </div>
+              </div>
+              <div className="text-right shrink-0">
+                {att.length > 0 && dueTotal < 0.001 ? (
+                  <span className="text-xs font-semibold text-emerald-400">all paid ✓</span>
+                ) : dueTotal > 0.001 ? (
+                  <span className="font-mono text-sm font-bold text-orange-400">
+                    {money(dueTotal)} due
+                  </span>
+                ) : null}
+              </div>
+            </button>
+
+            {isOpen && (
+              <div className="px-3 pb-3">
+                <div className="border-t border-stone-800 pt-2">
+                  <div className="text-[11px] text-stone-500 mb-1">
+                    Tap your name to check in or out.
+                  </div>
+                  {players.length === 0 ? (
+                    <p className="text-xs text-stone-500">No players yet.</p>
+                  ) : (
+                    players.map((p) => {
+                      const inSession = (s.attendees || []).includes(p.id);
+                      const due = (coverage[p.id] && coverage[p.id].bySession[s.id]) || 0;
+                      const paid = due < 0.001;
+                      return (
+                        <button
+                          key={p.id}
+                          onClick={() => onToggleAttendee(s.id, p.id)}
+                          className="w-full flex items-center justify-between py-1.5 text-sm"
+                        >
+                          <span className="flex items-center gap-2 min-w-0">
+                            <span
+                              className={`flex items-center justify-center h-4 w-4 rounded-full border text-[9px] shrink-0 ${
+                                inSession
+                                  ? "bg-orange-500 border-orange-500 text-stone-950"
+                                  : "border-stone-600 text-transparent"
+                              }`}
+                            >
+                              ✓
+                            </span>
+                            <span className={inSession ? "text-stone-200" : "text-stone-500"}>
+                              {p.name}
+                            </span>
+                          </span>
+                          {inSession && (
+                            <span className="flex items-baseline gap-2 shrink-0">
+                              <span className="font-mono text-stone-400">{money(share)}</span>
+                              <span
+                                className={`text-[11px] font-semibold ${
+                                  paid ? "text-emerald-400" : "text-orange-400"
+                                }`}
+                              >
+                                {paid ? "paid ✓" : `${money(due)} due`}
+                              </span>
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function UpcomingSessions({ sessions, players }) {
   const t = todayISO();
   const pmap = Object.fromEntries(players.map((p) => [p.id, p.name]));
@@ -809,14 +1075,45 @@ function UpcomingSessions({ sessions, players }) {
 
 /* ---------- Roster manager ---------- */
 
-function RosterManager({ rows, onAdd, onRemove, onPay }) {
+function RosterManager({ rows, onAdd, onRemove, onPay, onToggleRegular, fronted, collected }) {
   const [name, setName] = useState("");
-  const [payFor, setPayFor] = useState(null);
+  const [payFor, setPayFor] = useState(null); // { id, mode: 'pay' | 'refund' }
   const [payAmt, setPayAmt] = useState("");
   const [confirmDel, setConfirmDel] = useState(null);
 
+  const owedToYou = rows.reduce((s, r) => s + Math.max(0, r.balance), 0);
+  const toRefund = rows.reduce((s, r) => s + Math.max(0, -r.balance), 0);
+
+  const openPanel = (id, mode, prefill) => {
+    setPayFor(payFor && payFor.id === id && payFor.mode === mode ? null : { id, mode });
+    setPayAmt(prefill != null ? String(prefill) : "");
+  };
+
   return (
     <div className="mt-4">
+      {/* Your ledger */}
+      <div className="rounded-xl border border-stone-800 bg-stone-900 p-3 mb-3">
+        <div className="text-[11px] uppercase tracking-widest text-stone-500 mb-2">Your ledger</div>
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+          <div className="flex justify-between">
+            <span className="text-stone-400">Fronted</span>
+            <span className="font-mono text-stone-200">{money(fronted)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-stone-400">Collected</span>
+            <span className="font-mono text-stone-200">{money(collected)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-stone-400">Owed to you</span>
+            <span className="font-mono text-orange-400">{money(owedToYou)}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-stone-400">To refund</span>
+            <span className="font-mono text-sky-400">{money(toRefund)}</span>
+          </div>
+        </div>
+      </div>
+
       <div className="flex gap-2">
         <input
           value={name}
@@ -843,85 +1140,117 @@ function RosterManager({ rows, onAdd, onRemove, onPay }) {
 
       <div className="mt-4 space-y-2">
         {rows.length === 0 && <EmptyNote text="No players yet." />}
-        {rows.map((r) => (
-          <div key={r.id} className="rounded-xl border border-stone-800 bg-stone-900 p-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="font-semibold">{r.name}</div>
-                <div className="text-[11px] text-stone-500 font-mono">
-                  paid {money(r.paid)} · owes{" "}
-                  <span className={r.balance > 0.001 ? "text-orange-400" : "text-emerald-400"}>
-                    {money(Math.max(0, r.balance))}
-                  </span>
+        {rows.map((r) => {
+          const credit = r.balance < -0.001;
+          const owes = r.balance > 0.001;
+          return (
+            <div key={r.id} className="rounded-xl border border-stone-800 bg-stone-900 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold truncate">{r.name}</span>
+                    <button
+                      onClick={() => onToggleRegular(r.id)}
+                      className={`text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded ${
+                        r.regular
+                          ? "bg-orange-500 text-stone-950"
+                          : "bg-stone-800 text-stone-500 hover:text-stone-300"
+                      }`}
+                      title="Regulars are auto-added to every new session"
+                    >
+                      {r.regular ? "★ Regular" : "Regular?"}
+                    </button>
+                  </div>
+                  <div className="text-[11px] text-stone-500 font-mono">
+                    paid {money(r.paid)} ·{" "}
+                    {credit ? (
+                      <span className="text-sky-400">credit {money(-r.balance)}</span>
+                    ) : owes ? (
+                      <span className="text-orange-400">owes {money(r.balance)}</span>
+                    ) : (
+                      <span className="text-emerald-400">square</span>
+                    )}
+                  </div>
                 </div>
-              </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => {
-                    setPayFor(payFor === r.id ? null : r.id);
-                    setPayAmt("");
-                  }}
-                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30"
-                >
-                  Log payment
-                </button>
                 <button
                   onClick={() => setConfirmDel(confirmDel === r.id ? null : r.id)}
-                  className="text-xs px-2.5 py-1.5 rounded-lg bg-stone-800 text-stone-400 hover:bg-rose-900/40 hover:text-rose-300"
+                  className="shrink-0 text-xs px-2.5 py-1.5 rounded-lg bg-stone-800 text-stone-400 hover:bg-rose-900/40 hover:text-rose-300"
                   aria-label={`Remove ${r.name}`}
                 >
                   ✕
                 </button>
               </div>
-            </div>
 
-            {payFor === r.id && (
-              <div className="mt-3 flex gap-2">
-                <input
-                  type="number"
-                  inputMode="decimal"
-                  value={payAmt}
-                  onChange={(e) => setPayAmt(e.target.value)}
-                  placeholder={r.balance > 0 ? `e.g. ${money(r.balance).slice(1)}` : "Amount"}
-                  className="flex-1 rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none focus:border-emerald-500"
-                />
+              <div className="mt-2 flex gap-2">
                 <button
-                  onClick={() => {
-                    onPay(r.id, payAmt);
-                    setPayFor(null);
-                    setPayAmt("");
-                  }}
-                  className="px-4 rounded-lg bg-emerald-500 text-stone-950 text-sm font-semibold hover:bg-emerald-400"
+                  onClick={() => openPanel(r.id, "pay", owes ? Math.round(r.balance * 100) / 100 : "")}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/30"
                 >
-                  Save
+                  Log payment
+                </button>
+                <button
+                  onClick={() => openPanel(r.id, "refund", credit ? Math.round(-r.balance * 100) / 100 : "")}
+                  className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-sky-600/20 text-sky-300 hover:bg-sky-600/30"
+                >
+                  Refund
                 </button>
               </div>
-            )}
 
-            {confirmDel === r.id && (
-              <div className="mt-3 flex items-center justify-between rounded-lg bg-rose-950/40 border border-rose-900 px-3 py-2">
-                <span className="text-xs text-rose-300">Remove {r.name} and their history?</span>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setConfirmDel(null)}
-                    className="text-xs px-2 py-1 rounded text-stone-400"
-                  >
-                    Keep
-                  </button>
+              {payFor && payFor.id === r.id && (
+                <div className="mt-3 flex gap-2">
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    value={payAmt}
+                    onChange={(e) => setPayAmt(e.target.value)}
+                    placeholder={payFor.mode === "refund" ? "Refund amount" : "Payment amount"}
+                    className={`flex-1 rounded-lg bg-stone-800 border border-stone-700 px-3 py-2 text-sm outline-none ${
+                      payFor.mode === "refund" ? "focus:border-sky-500" : "focus:border-emerald-500"
+                    }`}
+                  />
                   <button
                     onClick={() => {
-                      onRemove(r.id);
-                      setConfirmDel(null);
+                      const amt = num(payAmt);
+                      if (amt > 0) onPay(r.id, payFor.mode === "refund" ? -amt : amt);
+                      setPayFor(null);
+                      setPayAmt("");
                     }}
-                    className="text-xs px-3 py-1 rounded bg-rose-600 text-white font-semibold"
+                    className={`px-4 rounded-lg text-stone-950 text-sm font-semibold ${
+                      payFor.mode === "refund"
+                        ? "bg-sky-500 hover:bg-sky-400"
+                        : "bg-emerald-500 hover:bg-emerald-400"
+                    }`}
                   >
-                    Remove
+                    {payFor.mode === "refund" ? "Refund" : "Save"}
                   </button>
                 </div>
-              </div>
-            )}
-          </div>
-        ))}
+              )}
+
+              {confirmDel === r.id && (
+                <div className="mt-3 flex items-center justify-between rounded-lg bg-rose-950/40 border border-rose-900 px-3 py-2">
+                  <span className="text-xs text-rose-300">Remove {r.name} and their history?</span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setConfirmDel(null)}
+                      className="text-xs px-2 py-1 rounded text-stone-400"
+                    >
+                      Keep
+                    </button>
+                    <button
+                      onClick={() => {
+                        onRemove(r.id);
+                        setConfirmDel(null);
+                      }}
+                      className="text-xs px-3 py-1 rounded bg-rose-600 text-white font-semibold"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -937,7 +1266,9 @@ function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove,
   const [totalCost, setTotalCost] = useState("");
   const [courtId, setCourtId] = useState(null);
   const [other, setOther] = useState(false);
-  const [attendees, setAttendees] = useState([]);
+  const [attendees, setAttendees] = useState(() =>
+    players.filter((p) => p.regular).map((p) => p.id)
+  );
   const [expanded, setExpanded] = useState(null);
 
   useEffect(() => {
@@ -982,7 +1313,7 @@ function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove,
     setTotalCost("");
     setCourtId(null);
     setOther(false);
-    setAttendees([]);
+    setAttendees(players.filter((p) => p.regular).map((p) => p.id));
   };
 
   const pmap = Object.fromEntries(players.map((p) => [p.id, p.name]));
@@ -1085,6 +1416,7 @@ function SessionsManager({ players, courts, sessions, onAdd, onUpdate, onRemove,
                         : "bg-stone-800 border-stone-700 text-stone-400"
                     }`}
                   >
+                    {p.regular ? "★ " : ""}
                     {p.name}
                   </button>
                 );
